@@ -7,409 +7,262 @@ Original file is located at
     https://colab.research.google.com/drive/1NmEb2wxYSNYCo9q3If9YFce174GVvwmh
 """
 
-from collections import deque
 import time
+from getpass import getpass
+from io import StringIO
 
 import numpy as np
 import pandas as pd
-from plotly.subplots import make_subplots
 import requests
-import streamlit as st
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from IPython.display import clear_output, display
 
-st.set_page_config(
-    page_title="Sky Watch | Deteksi Anomali Pesawat",
-    page_icon="✈️",
-    layout="wide",
-)
+# --- Konfigurasi ---
+MAP_KEY = getpass("Masukkan MAP_KEY FIRMS: ")   # tidak akan tampil di layar
+SENSOR  = "VIIRS_SNPP_NRT"                      # NRT = data terbaru; pakai VIIRS_SNPP_SP untuk arsip lama
+AREA    = "95,-11,141,6"                        # barat,selatan,timur,utara (Indonesia)
+HARI_MUNDUR = 60                                # panjang data yang ditarik (hari)
 
-st.title("✈️ Sky Watch | Deteksi Anomali Kecepatan & Ketinggian Pesawat")
-st.caption(
-    "Data real-time dari OpenSky Network (API gratis). Mendeteksi pesawat dengan "
-    "kecepatan/ketinggian tidak wajar lewat kombinasi pola: batas fisik+durasi, "
-    "lonjakan mendadak, squawk darurat, dan absence. Semua ditulis langsung di "
-    "Python/pandas."
-)
+# Parameter bagan kendali
+BASELINE_DAYS = 30        # Fase I: hari awal untuk menghitung batas kendali
+SIGMA_K       = 3         # lebar batas kendali (k-sigma)
 
-st.sidebar.header("⚙️ Pengaturan Dashboard")
+# Parameter pola CEP
+WINDOW_SIZE     = 7       # rolling window (hari)
+Z_THRESH        = 2.0     # ambang z-score anomali titik
+MIN_CONSECUTIVE = 3       # Threshold+Durasi: min. hari beruntun di luar batas
+TREND_LEN       = 3       # Trend: min. hari konsisten naik/turun
+SEQ_WINDOW      = 3       # Sequence: anomali FRP dalam N hari setelah anomali jumlah
+ABSENCE_JAM     = 12      # Absence: batas jam tanpa deteksi baru
 
-st.sidebar.subheader("🗺️ Area Pantauan (Bounding Box)")
-LAMIN = st.sidebar.number_input("Lintang minimum", min_value=-90.0, max_value=90.0, value=-9.5, step=0.5)
-LAMAX = st.sidebar.number_input("Lintang maksimum", min_value=-90.0, max_value=90.0, value=-5.0, step=0.5)
-LOMIN = st.sidebar.number_input("Bujur minimum", min_value=-180.0, max_value=180.0, value=105.0, step=0.5)
-LOMAX = st.sidebar.number_input("Bujur maksimum", min_value=-180.0, max_value=180.0, value=116.0, step=0.5)
-
-POLL_SECONDS = st.sidebar.number_input(
-    "Interval Update (Detik)", min_value=10, max_value=600, value=60,
-    help="API anonim OpenSky punya kuota harian dan resolusi data sekitar 10 detik. Jangan terlalu kecil."
-)
-MAX_SNAPSHOT = st.sidebar.number_input("Max Snapshot di Buffer", min_value=5, max_value=200, value=30)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🚨 Batas Wajar Pesawat")
-MAX_SPEED_KMH = st.sidebar.number_input("Kecepatan maksimum (km/jam)", min_value=800, max_value=1500, value=1000)
-MAX_ALT_M = st.sidebar.number_input("Ketinggian maksimum (m)", min_value=10000, max_value=20000, value=15000)
-MIN_SPEED_KMH = st.sidebar.number_input(
-    "Kecepatan minimum di ketinggian tinggi (km/jam)", min_value=50, max_value=400, value=200,
-    help="Pesawat yang terbang di atas ketinggian tertentu tapi lebih lambat dari ini dianggap janggal (mendekati stall)."
-)
-MIN_ALT_FOR_MINSPEED = st.sidebar.number_input("Syarat ketinggian untuk batas minimum (m)", min_value=1000, max_value=10000, value=5000)
-Z_THRESH = st.sidebar.slider(
-    "Ambang Robust Z-Score (antar pesawat)", min_value=2.0, max_value=6.0, value=3.5, step=0.1,
-    help="Dihitung hanya untuk pesawat di ketinggian jelajah (>= 8000 m) pada snapshot yang sama."
-)
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("🧩 Parameter Pola")
-MIN_CONSECUTIVE = st.sidebar.number_input(
-    "Batas Fisik: min. snapshot beruntun", min_value=1, max_value=10, value=2,
-    help="Anomali baru dianggap valid kalau bertahan minimal segini snapshot berturut-turut pada pesawat yang sama."
-)
-MAX_ACCEL = st.sidebar.number_input(
-    "Lonjakan: percepatan maks (m/s²)", min_value=1.0, max_value=30.0, value=5.0, step=0.5,
-    help="Perubahan kecepatan per detik antar dua snapshot."
-)
-MAX_ALT_RATE = st.sidebar.number_input(
-    "Lonjakan: laju naik/turun maks (m/s)", min_value=10.0, max_value=200.0, value=50.0, step=5.0,
-    help="Perubahan ketinggian per detik antar dua snapshot (50 m/s ≈ 10.000 ft/menit)."
-)
-ABSENCE_TOLERANCE = st.sidebar.slider(
-    "Absence: toleransi (x interval update)", min_value=1.5, max_value=10.0, value=3.0, step=0.5,
-    help="Alert 'data hilang' menyala jika tidak ada snapshot baru selama lebih dari toleransi x interval update."
-)
-
-is_running = st.sidebar.toggle("Jalankan Real-Time Update", value=True)
-
-if st.sidebar.button("🔄 Reset / Reload Data"):
-    st.session_state.clear()
-    st.rerun()
-
-OPENSKY_URL = "https://opensky-network.org/api/states/all"
-STATE_COLUMNS = [
-    "icao24", "callsign", "origin_country", "time_position", "last_contact",
-    "longitude", "latitude", "baro_altitude", "on_ground", "velocity",
-    "true_track", "vertical_rate", "sensors", "geo_altitude", "squawk",
-    "spi", "position_source",
-]
-SQUAWK_DARURAT = {"7500": "pembajakan", "7600": "radio mati", "7700": "darurat umum"}
-
-
-def fetch_states(lamin, lomin, lamax, lomax):
-    """Mengambil 1 snapshot posisi semua pesawat di dalam bounding box.
-    Mengembalikan (DataFrame, pesan_error). DataFrame = None jika request gagal."""
-    params = {"lamin": lamin, "lomin": lomin, "lamax": lamax, "lomax": lomax}
-    try:
-        resp = requests.get(OPENSKY_URL, params=params, timeout=20)
-        if resp.status_code == 429:
-            return None, "Rate limit OpenSky tercapai (HTTP 429). Perbesar interval update atau kecilkan area."
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as e:
-        return None, f"Gagal mengambil data OpenSky: {e}"
-
-    states = payload.get("states")
-    if not states:
-        return pd.DataFrame(), None
-
-    raw = pd.DataFrame(states).iloc[:, :len(STATE_COLUMNS)]
-    raw.columns = STATE_COLUMNS
-
-    raw["callsign"] = raw["callsign"].astype(str).str.strip().replace({"": np.nan, "None": np.nan})
-    raw["label"] = raw["callsign"].fillna(raw["icao24"])
-    raw["timestamp"] = pd.to_datetime(payload["time"], unit="s", utc=True)
-    raw["alt_m"] = pd.to_numeric(raw["baro_altitude"], errors="coerce").fillna(
-        pd.to_numeric(raw["geo_altitude"], errors="coerce")
-    )
-    raw["speed_ms"] = pd.to_numeric(raw["velocity"], errors="coerce")
-    raw["speed_kmh"] = raw["speed_ms"] * 3.6
-
-    df = raw[raw["on_ground"] == False]  # hanya pesawat yang sedang terbang
-    df = df.dropna(subset=["alt_m", "speed_ms", "longitude", "latitude"])
-    return df[[
-        "timestamp", "icao24", "label", "origin_country", "longitude", "latitude",
-        "alt_m", "speed_ms", "speed_kmh", "squawk",
-    ]].reset_index(drop=True), None
-
-def consecutive_true_count(mask: pd.Series) -> pd.Series:
-    """Panjang 'streak' True berturut-turut yang berakhir di tiap baris.
-    [F,T,T,T,F,T] -> [0,1,2,3,0,1]. Dipakai untuk pola Batas Fisik+Durasi."""
-    counts = np.zeros(len(mask), dtype=int)
-    running = 0
-    for i, v in enumerate(mask.to_numpy()):
-        running = running + 1 if v else 0
-        counts[i] = running
-    return pd.Series(counts, index=mask.index)
-
-
-def robust_z(s: pd.Series, min_n: int = 5) -> pd.Series:
-    """Z-score robust (median & MAD) sehingga tidak mudah terdistorsi oleh outlier.
-    Jika pesawat terlalu sedikit atau MAD = 0, dianggap tidak ada penyimpangan."""
-    if s.notna().sum() < min_n:
-        return pd.Series(0.0, index=s.index)
-    med = s.median()
-    mad = (s - med).abs().median()
-    if pd.isna(mad) or mad == 0:
-        return pd.Series(0.0, index=s.index)
-    return 0.6745 * (s - med) / mad
-
-
-def analyze_buffer(buffer_data, max_speed, max_alt, min_speed, min_alt_for_speed,
-                   z_thresh, max_accel, max_alt_rate, min_consecutive):
-    """Menghitung fitur per pesawat + 3 pola deteksi di atasnya."""
-    frames = list(buffer_data)
-    if not frames:
+def tarik_firms(map_key, sensor, area, hari_mundur, chunk=5):
+    """Menarik data hotspot per potongan 5 hari lalu menggabungkannya."""
+    akhir = pd.Timestamp.utcnow().tz_localize(None).normalize()
+    awal = akhir - pd.Timedelta(days=hari_mundur)
+    potongan = []
+    for tgl in pd.date_range(awal, akhir, freq=f"{chunk}D"):
+        url = (f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
+               f"{map_key}/{sensor}/{area}/{chunk}/{tgl:%Y-%m-%d}")
+        try:
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            d = pd.read_csv(StringIO(r.text))
+            if "latitude" in d.columns and len(d) > 0:
+                potongan.append(d)
+        except Exception as e:
+            print(f"Gagal {tgl:%Y-%m-%d}: {e}")
+        time.sleep(0.5)
+    if not potongan:
         return pd.DataFrame()
+    df = pd.concat(potongan, ignore_index=True).drop_duplicates()
 
-    df = pd.concat(frames, ignore_index=True)
-    df = (df.sort_values(["icao24", "timestamp"])
-            .drop_duplicates(["icao24", "timestamp"])
-            .reset_index(drop=True))
+    # Gabungkan tanggal + jam (UTC) jadi satu kolom waktu
+    df["acq_time"] = df["acq_time"].astype(int).astype(str).str.zfill(4)
+    df["waktu"] = pd.to_datetime(df["acq_date"] + " " + df["acq_time"],
+                                 format="%Y-%m-%d %H%M", errors="coerce")
 
-    # --- Perubahan antar snapshot untuk tiap pesawat ---
-    g = df.groupby("icao24")
-    dt = g["timestamp"].diff().dt.total_seconds()
-    dt = dt.where((dt > 0) & (dt <= 300))  # abaikan jeda terlalu panjang
-    df["accel"] = g["speed_ms"].diff() / dt        # m/s^2
-    df["alt_rate"] = g["alt_m"].diff() / dt        # m/s
+    # Saring confidence: VIIRS berupa huruf (l/n/h), MODIS berupa angka
+    if df["confidence"].dtype == object:
+        df = df[df["confidence"].isin(["n", "h", "nominal", "high"])]
+    else:
+        df = df[df["confidence"] >= 30]
+    return df.dropna(subset=["waktu"]).reset_index(drop=True)
 
-    # --- Z-score kecepatan antar pesawat di ketinggian jelajah (per snapshot) ---
-    cruise = df["alt_m"] >= 8000
-    df["z_speed"] = np.nan
-    if cruise.any():
-        df.loc[cruise, "z_speed"] = (
-            df[cruise].groupby("timestamp")["speed_kmh"].transform(robust_z)
-        )
 
-    # POLA 1 — Batas Fisik + Durasi
-    df["speed_high"] = df["speed_kmh"] > max_speed
-    df["alt_high"] = df["alt_m"] > max_alt
-    df["speed_low"] = (df["speed_kmh"] < min_speed) & (df["alt_m"] >= min_alt_for_speed)
-    df["z_anomaly"] = df["z_speed"].abs() > z_thresh
-    df["state_raw"] = df[["speed_high", "alt_high", "speed_low", "z_anomaly"]].any(axis=1)
-    df["streak"] = df.groupby("icao24")["state_raw"].transform(consecutive_true_count)
-    df["state_pattern"] = df["streak"] >= min_consecutive
+def agregasi_harian(df):
+    """Mengubah titik hotspot menjadi deret harian: jumlah dan rata-rata FRP."""
+    harian = (df.assign(tanggal=df["waktu"].dt.normalize())
+                .groupby("tanggal")
+                .agg(jumlah=("frp", "size"), frp_mean=("frp", "mean"))
+                .asfreq("D"))
+    harian["jumlah"] = harian["jumlah"].fillna(0)
+    harian["frp_mean"] = harian["frp_mean"].interpolate(limit_direction="both")
+    return harian.reset_index()
 
-    # POLA 2 — Lonjakan Mendadak (event sesaat, tidak perlu durasi)
-    df["accel_high"] = df["accel"].abs() > max_accel
-    df["rate_high"] = df["alt_rate"].abs() > max_alt_rate
-    df["jump_pattern"] = df["accel_high"] | df["rate_high"]
+def consecutive_true_count(mask):
+    """[F,T,T,T,F,T] -> [0,1,2,3,0,1]  (streak True yang berakhir di tiap baris)."""
+    hasil, run = [], 0
+    for v in mask.to_numpy():
+        run = run + 1 if v else 0
+        hasil.append(run)
+    return pd.Series(hasil, index=mask.index)
 
-    # POLA 3 — Squawk Darurat
-    df["emergency_pattern"] = df["squawk"].isin(list(SQUAWK_DARURAT.keys()))
 
-    df["anomaly"] = df["state_pattern"] | df["jump_pattern"] | df["emergency_pattern"]
+def consecutive_same_sign(diff):
+    """Panjang streak arah konsisten (naik/turun). Nilai 0 atau NaN memutus streak."""
+    sign = np.sign(diff.fillna(0)).to_numpy()
+    hasil, run, prev = [], 0, 0
+    for s in sign:
+        if s != 0 and s == prev:
+            run += 1
+        elif s != 0:
+            run = 1
+        else:
+            run = 0
+        hasil.append(run)
+        prev = s
+    return pd.Series(hasil, index=diff.index)
+
+
+def batas_kendali_laney(c, baseline_n, k=3):
+    """Bagan c' Laney: c-chart yang dikoreksi untuk overdispersi.
+    Cocok untuk data hotspot yang ragamnya jauh lebih besar dari rata-ratanya."""
+    base = c.iloc[:baseline_n]
+    cbar = base.mean()
+    z = (base - cbar) / np.sqrt(cbar)
+    sigma_z = z.diff().abs().mean() / 1.128        # estimasi sigma dari moving range
+    lebar = k * np.sqrt(cbar) * sigma_z
+    return cbar, cbar + lebar, max(cbar - lebar, 0)
+
+
+def analisis(harian):
+    df = harian.copy()
+
+    # --- Bagan kendali (Fase I dihitung dari baseline, Fase II memantau seluruh data) ---
+    cl, ucl, lcl = batas_kendali_laney(df["jumlah"], BASELINE_DAYS, SIGMA_K)
+    df["cl"], df["ucl"], df["lcl"] = cl, ucl, lcl
+
+    # --- Anomali titik (z-score terhadap window sebelumnya) ---
+    pm = df["jumlah"].shift(1).rolling(WINDOW_SIZE).mean()
+    ps = df["jumlah"].shift(1).rolling(WINDOW_SIZE).std()
+    df["z_jumlah"] = (df["jumlah"] - pm) / ps
+    df["anomali_jumlah"] = df["z_jumlah"].abs() > Z_THRESH
+
+    fm = df["frp_mean"].shift(1).rolling(WINDOW_SIZE).mean()
+    fs = df["frp_mean"].shift(1).rolling(WINDOW_SIZE).std()
+    df["z_frp"] = (df["frp_mean"] - fm) / fs
+    df["anomali_frp"] = df["z_frp"].abs() > Z_THRESH
+
+    # --- POLA 1: Threshold + Durasi ---
+    df["streak_atas"]  = consecutive_true_count(df["jumlah"] > df["ucl"])
+    df["streak_bawah"] = consecutive_true_count(df["jumlah"] < df["lcl"])
+    df["pola_threshold"] = ((df["streak_atas"] >= MIN_CONSECUTIVE) |
+                            (df["streak_bawah"] >= MIN_CONSECUTIVE))
+    df["sisi"] = np.select([df["streak_atas"] >= MIN_CONSECUTIVE,
+                            df["streak_bawah"] >= MIN_CONSECUTIVE],
+                           ["atas (UCL)", "bawah (LCL)"], default="-")
+
+    # --- POLA 2: Trend (rolling mean naik/turun konsisten) ---
+    df["rolling_mean"] = df["jumlah"].rolling(WINDOW_SIZE).mean()
+    selisih = df["rolling_mean"].diff()
+    df["streak_trend"] = consecutive_same_sign(selisih)
+    df["pola_trend"] = df["streak_trend"] >= TREND_LEN
+    df["arah_trend"] = np.select([selisih > 0, selisih < 0], ["naik", "turun"], default="-")
+
+    # --- POLA 3: Sequence + Correlation (anomali jumlah -> anomali FRP dalam window) ---
+    anomali_jumlah_baru = (df["anomali_jumlah"].shift(1)
+                           .rolling(SEQ_WINDOW, min_periods=1).max()
+                           .fillna(0).astype(bool))
+    df["pola_sequence"] = df["anomali_frp"].fillna(False) & anomali_jumlah_baru
     return df
 
 
-def compute_absence_alert(last_timestamp, poll_seconds, tolerance):
-    """POLA 4 — Absence: tidak ada snapshot baru dalam window yang diharapkan."""
-    if last_timestamp is None:
-        return False, 0.0
-    now = pd.Timestamp.now(tz=last_timestamp.tzinfo) if last_timestamp.tzinfo else pd.Timestamp.now()
-    gap = (now - last_timestamp).total_seconds()
-    return gap > poll_seconds * tolerance, gap
+def cek_absence(df_titik, batas_jam):
+    """POLA 4: tidak ada deteksi hotspot baru melebihi batas jam."""
+    terakhir = df_titik["waktu"].max()
+    gap_jam = (pd.Timestamp.utcnow().tz_localize(None) - terakhir).total_seconds() / 3600
+    return gap_jam > batas_jam, gap_jam, terakhir
 
 
-def build_event_log(df, max_rows=30):
-    """Mengumpulkan semua pola yang terdeteksi jadi satu log event."""
-    cols = ["timestamp", "pesawat", "pola", "deskripsi"]
-    if df.empty or not df["anomaly"].any():
-        return pd.DataFrame(columns=cols)
+def buat_log(df):
+    kejadian = []
+    for _, r in df.iterrows():
+        if r["pola_threshold"]:
+            n = int(max(r["streak_atas"], r["streak_bawah"]))
+            kejadian.append((r["tanggal"], "Threshold+Durasi",
+                             f"Jumlah hotspot di {r['sisi']} batas kendali {n} hari beruntun",
+                             int(r["jumlah"])))
+        if r["pola_trend"]:
+            kejadian.append((r["tanggal"], "Trend",
+                             f"Rolling mean {r['arah_trend']} konsisten {int(r['streak_trend'])} hari",
+                             int(r["jumlah"])))
+        if r["pola_sequence"]:
+            kejadian.append((r["tanggal"], "Sequence+Correlation",
+                             "Anomali FRP menyusul anomali jumlah hotspot (dalam window)",
+                             int(r["jumlah"])))
+    log = pd.DataFrame(kejadian, columns=["tanggal", "pola", "deskripsi", "jumlah_hotspot"])
+    return log.sort_values("tanggal", ascending=False).reset_index(drop=True)
 
-    events = []
-    for _, row in df[df["anomaly"]].iterrows():
-        base = {"timestamp": row["timestamp"], "pesawat": row["label"]}
+def tampilkan(df_titik, df):
+    absen, gap_jam, terakhir = cek_absence(df_titik, ABSENCE_JAM)
+    last = df.iloc[-1]
 
-        if row["state_pattern"]:
-            alasan = []
-            if row["speed_high"]:
-                alasan.append(f"kecepatan {row['speed_kmh']:,.0f} km/jam melebihi batas")
-            if row["alt_high"]:
-                alasan.append(f"ketinggian {row['alt_m']:,.0f} m melebihi batas")
-            if row["speed_low"]:
-                alasan.append(f"kecepatan {row['speed_kmh']:,.0f} km/jam terlalu rendah untuk ketinggian {row['alt_m']:,.0f} m")
-            if row["z_anomaly"]:
-                alasan.append(f"kecepatan menyimpang dari pesawat lain (z={row['z_speed']:.1f})")
-            events.append({**base, "pola": "Batas Fisik+Durasi",
-                           "deskripsi": "; ".join(alasan) + f" — {int(row['streak'])}x beruntun"})
+    print("=" * 60)
+    print(f"Deteksi terakhir : {terakhir}  ({gap_jam:.1f} jam lalu)")
+    print(f"Jumlah hotspot terakhir: {int(last['jumlah'])}  |  FRP rata-rata: {last['frp_mean']:.2f}")
+    print(f"Batas kendali -> CL: {last['cl']:.1f}  UCL: {last['ucl']:.1f}  LCL: {last['lcl']:.1f}")
+    print("-" * 60)
+    print("Threshold+Durasi :", f"BREACH {last['sisi']}" if last["pola_threshold"] else "Normal")
+    print("Trend            :", f"{last['arah_trend']} ({int(last['streak_trend'])}x)" if last["pola_trend"] else "Tidak ada trend kuat")
+    print("Sequence+Corr    :", "Terdeteksi" if last["pola_sequence"] else "Tidak ada")
+    print("Absence          :", f"DATA HILANG {gap_jam:.1f} jam" if absen else "Normal")
+    print("=" * 60)
 
-        if row["jump_pattern"]:
-            alasan = []
-            if row["accel_high"]:
-                alasan.append(f"percepatan {row['accel']:+.1f} m/s²")
-            if row["rate_high"]:
-                alasan.append(f"laju vertikal {row['alt_rate']:+.1f} m/s")
-            events.append({**base, "pola": "Lonjakan Mendadak",
-                           "deskripsi": "Perubahan tidak wajar antar snapshot: " + ", ".join(alasan)})
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3],
+                        vertical_spacing=0.07,
+                        subplot_titles=("Bagan Kendali c' Laney: Jumlah Hotspot Harian",
+                                        "Rata-rata FRP Harian"))
+    x = df["tanggal"]
+    fig.add_trace(go.Scatter(x=x, y=df["jumlah"], mode="lines+markers", name="Jumlah hotspot",
+                             line=dict(color="#1f77b4")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df["cl"], mode="lines", name="CL",
+                             line=dict(color="green")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df["ucl"], mode="lines", name="UCL",
+                             line=dict(dash="dash", color="red")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df["lcl"], mode="lines", name="LCL",
+                             line=dict(dash="dash", color="red")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=x, y=df["rolling_mean"], mode="lines", name="Rolling mean",
+                             line=dict(color="#ff7f0e", width=1.5)), row=1, col=1)
 
-        if row["emergency_pattern"]:
-            events.append({**base, "pola": "Squawk Darurat",
-                           "deskripsi": f"Squawk {row['squawk']} ({SQUAWK_DARURAT[row['squawk']]})"})
+    def tandai(mask, nama, warna, simbol, ukuran, baris=1, kolom="jumlah"):
+        d = df[mask]
+        if not d.empty:
+            fig.add_trace(go.Scatter(x=d["tanggal"], y=d[kolom], mode="markers", name=nama,
+                                     marker=dict(color=warna, symbol=simbol, size=ukuran)),
+                          row=baris, col=1)
 
-    log = pd.DataFrame(events).sort_values("timestamp", ascending=False)
-    return log.head(max_rows).reset_index(drop=True)
+    tandai(df["anomali_jumlah"], "Anomali titik (z-score)", "red", "x", 8)
+    tandai(df["pola_threshold"], "Pola Threshold+Durasi", "darkred", "diamond", 13)
+    tandai(df["pola_trend"], "Pola Trend", "#9467bd", "triangle-up", 8)
+    tandai(df["pola_sequence"], "Pola Sequence+Correlation", "black", "star", 13)
 
-if "buffer" not in st.session_state:
-    st.session_state.buffer = deque(maxlen=MAX_SNAPSHOT)
-    st.session_state.last_fetch = 0.0
-    st.session_state.last_error = None
+    fig.add_trace(go.Bar(x=x, y=df["frp_mean"], name="FRP rata-rata",
+                         marker=dict(color="#a3c4dc")), row=2, col=1)
+    tandai(df["pola_sequence"], "FRP anomali (sequence)", "black", "star", 11, baris=2, kolom="frp_mean")
 
-# Fetch dibatasi oleh interval, supaya interaksi widget tidak menghabiskan kuota API
-elapsed = time.time() - st.session_state.last_fetch
-if st.session_state.last_fetch == 0.0 or (is_running and elapsed >= POLL_SECONDS):
-    with st.spinner("Mengambil data OpenSky..."):
-        df_new, err = fetch_states(LAMIN, LOMIN, LAMAX, LOMAX)
-    st.session_state.last_fetch = time.time()
-    st.session_state.last_error = err
-    if df_new is not None and not df_new.empty:
-        buf = st.session_state.buffer
-        if len(buf) == 0 or buf[-1]["timestamp"].iloc[0] != df_new["timestamp"].iloc[0]:
-            buf.append(df_new)
+    fig.add_vrect(x0=x.iloc[0], x1=x.iloc[min(BASELINE_DAYS, len(x)) - 1],
+                  fillcolor="lightgray", opacity=0.25, line_width=0,
+                  annotation_text="Fase I (baseline)", row=1, col=1)
+    fig.update_layout(template="plotly_white", height=650,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="left", x=0))
+    fig.update_yaxes(title_text="Jumlah hotspot", row=1, col=1)
+    fig.update_yaxes(title_text="FRP (MW)", row=2, col=1)
+    fig.show()
 
-df_analyzed = analyze_buffer(
-    st.session_state.buffer, MAX_SPEED_KMH, MAX_ALT_M, MIN_SPEED_KMH,
-    MIN_ALT_FOR_MINSPEED, Z_THRESH, MAX_ACCEL, MAX_ALT_RATE, MIN_CONSECUTIVE
-)
+    log = buat_log(df)
+    print("\nEvent Pattern Log (terbaru di atas):")
+    display(log.head(20) if not log.empty else "Belum ada pola CEP yang terdeteksi.")
 
-"""# DASHBOARD"""
+titik = tarik_firms(MAP_KEY, SENSOR, AREA, HARI_MUNDUR)
 
-if st.session_state.last_error:
-    st.warning(f"⚠️ {st.session_state.last_error}")
-
-if not df_analyzed.empty:
-    last_ts = df_analyzed["timestamp"].max()
-    current = df_analyzed[df_analyzed["timestamp"] == last_ts]
-    is_absent, gap_seconds = compute_absence_alert(last_ts, POLL_SECONDS, ABSENCE_TOLERANCE)
-
-    if is_absent:
-        st.error(
-            f"🛑 **Pola Absence terdeteksi** — tidak ada snapshot baru selama "
-            f"{gap_seconds:,.0f} detik (toleransi: {POLL_SECONDS * ABSENCE_TOLERANCE:,.0f} detik). "
-            "Kemungkinan API OpenSky bermasalah atau kuota habis."
-        )
-    if len(st.session_state.buffer) < 2:
-        st.info("Baru 1 snapshot terkumpul. Deteksi lonjakan dan durasi butuh minimal 2 snapshot.")
-
-    st.markdown("#### 📊 Statistik Terkini")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Pesawat Terlacak", f"{len(current):,}")
-    c2.metric("Anomali Aktif", f"{int(current['anomaly'].sum()):,}")
-    c3.metric("Median Kecepatan", f"{current['speed_kmh'].median():,.0f} km/jam")
-    c4.metric("Median Ketinggian", f"{current['alt_m'].median():,.0f} m")
-    c5.metric("Snapshot di Buffer", f"{len(st.session_state.buffer)}")
-
-    st.markdown("#### 🧩 Status Pola Deteksi")
-    p1, p2, p3, p4 = st.columns(4)
-    with p1:
-        st.write("**Batas Fisik + Durasi**")
-        n = int(current["state_pattern"].sum())
-        st.error(f"⚠️ {n} pesawat di luar batas wajar") if n else st.success("✅ Normal")
-    with p2:
-        st.write("**Lonjakan Mendadak**")
-        n = int(current["jump_pattern"].sum())
-        st.warning(f"📈 {n} pesawat berubah drastis") if n else st.success("✅ Tidak ada lonjakan")
-    with p3:
-        st.write("**Squawk Darurat**")
-        n = int(current["emergency_pattern"].sum())
-        st.error(f"🚨 {n} pesawat squawk darurat") if n else st.success("✅ Tidak ada squawk darurat")
-    with p4:
-        st.write("**Absence**")
-        if is_absent:
-            st.error(f"🛑 Data hilang {gap_seconds:,.0f}s")
-        else:
-            st.success(f"✅ Update {gap_seconds:,.0f}s lalu")
-
-    st.markdown("---")
-
-    # -----------------------------------------------------
-    # Grafik: profil kecepatan-ketinggian (kiri) dan peta posisi (kanan)
-    # -----------------------------------------------------
-    normal = current[~current["anomaly"]]
-    anom = current[current["anomaly"]]
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        fig1 = go.Figure()
-        fig1.add_trace(go.Scatter(x=normal["speed_kmh"], y=normal["alt_m"], mode="markers",
-                                  name="Normal", text=normal["label"],
-                                  marker=dict(color="#1f77b4", size=7, opacity=0.7),
-                                  hovertemplate="%{text}<br>%{x:.0f} km/jam<br>%{y:.0f} m<extra></extra>"))
-        if not anom.empty:
-            fig1.add_trace(go.Scatter(x=anom["speed_kmh"], y=anom["alt_m"], mode="markers",
-                                      name="Anomali", text=anom["label"],
-                                      marker=dict(color="red", size=12, symbol="x"),
-                                      hovertemplate="%{text}<br>%{x:.0f} km/jam<br>%{y:.0f} m<extra></extra>"))
-        fig1.add_vline(x=MAX_SPEED_KMH, line_dash="dash", line_color="gray")
-        fig1.add_hline(y=MAX_ALT_M, line_dash="dash", line_color="gray")
-        fig1.update_layout(template="plotly_white", height=420, title="Profil Kecepatan vs Ketinggian",
-                           xaxis_title="Kecepatan (km/jam)", yaxis_title="Ketinggian (m)",
-                           margin=dict(l=20, r=20, t=50, b=20))
-        st.plotly_chart(fig1, use_container_width=True)
-
-    with col_b:
-        fig2 = go.Figure()
-        fig2.add_trace(go.Scattergeo(lon=normal["longitude"], lat=normal["latitude"], mode="markers",
-                                     name="Normal", text=normal["label"],
-                                     marker=dict(color="#1f77b4", size=5)))
-        if not anom.empty:
-            fig2.add_trace(go.Scattergeo(lon=anom["longitude"], lat=anom["latitude"], mode="markers",
-                                         name="Anomali", text=anom["label"],
-                                         marker=dict(color="red", size=11, symbol="x")))
-        fig2.update_geos(lataxis_range=[LAMIN, LAMAX], lonaxis_range=[LOMIN, LOMAX],
-                         showland=True, showcountries=True, resolution=50)
-        fig2.update_layout(template="plotly_white", height=420, title="Posisi Pesawat",
-                           margin=dict(l=20, r=20, t=50, b=20))
-        st.plotly_chart(fig2, use_container_width=True)
-
-    # -----------------------------------------------------
-    # Riwayat satu pesawat (default: pesawat anomali pertama)
-    # -----------------------------------------------------
-    st.markdown("#### 🔍 Riwayat Pesawat")
-    anom_labels = sorted(anom["label"].unique())
-    other_labels = [l for l in sorted(df_analyzed["label"].unique()) if l not in anom_labels]
-    pilih = st.selectbox("Pilih pesawat", anom_labels + other_labels)
-    hist = df_analyzed[df_analyzed["label"] == pilih].sort_values("timestamp")
-
-    fig3 = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.5, 0.5],
-                         vertical_spacing=0.08, subplot_titles=(f"Kecepatan: {pilih}", "Ketinggian"))
-    fig3.add_trace(go.Scatter(x=hist["timestamp"], y=hist["speed_kmh"], mode="lines+markers",
-                              name="Kecepatan", line=dict(color="#1f77b4")), row=1, col=1)
-    fig3.add_trace(go.Scatter(x=hist["timestamp"], y=hist["alt_m"], mode="lines+markers",
-                              name="Ketinggian", line=dict(color="#ff7f0e")), row=2, col=1)
-    hist_anom = hist[hist["anomaly"]]
-    if not hist_anom.empty:
-        fig3.add_trace(go.Scatter(x=hist_anom["timestamp"], y=hist_anom["speed_kmh"], mode="markers",
-                                  name="Anomali", marker=dict(color="red", size=11, symbol="x")), row=1, col=1)
-        fig3.add_trace(go.Scatter(x=hist_anom["timestamp"], y=hist_anom["alt_m"], mode="markers",
-                                  showlegend=False, marker=dict(color="red", size=11, symbol="x")), row=2, col=1)
-    fig3.add_hline(y=MAX_SPEED_KMH, line_dash="dash", line_color="gray", row=1, col=1)
-    fig3.add_hline(y=MAX_ALT_M, line_dash="dash", line_color="gray", row=2, col=1)
-    fig3.update_layout(template="plotly_white", height=480, margin=dict(l=20, r=20, t=50, b=20),
-                       legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0))
-    fig3.update_yaxes(title_text="km/jam", row=1, col=1)
-    fig3.update_yaxes(title_text="meter", row=2, col=1)
-    fig3.update_xaxes(title_text="Waktu (UTC)", row=2, col=1)
-    st.plotly_chart(fig3, use_container_width=True)
-
-    # -----------------------------------------------------
-    # Event Pattern Log
-    # -----------------------------------------------------
-    st.markdown("#### 📜 Event Pattern Log")
-    st.caption("Daftar semua kejadian anomali yang terdeteksi pada buffer saat ini (terbaru di atas).")
-    event_log = build_event_log(df_analyzed, max_rows=30)
-    if event_log.empty:
-        st.info("Belum ada anomali yang terdeteksi pada buffer saat ini.")
-    else:
-        st.dataframe(event_log, use_container_width=True, hide_index=True)
-
-    with st.expander("📄 Lihat Data Mentah Terakhir (10 Baris)", expanded=False):
-        st.dataframe(df_analyzed.tail(10).round(4), use_container_width=True)
-
+if titik.empty:
+    print("[PERINGATAN] Tidak ada data hotspot yang berhasil ditarik.")
+    print("Silakan periksa kembali apakah MAP_KEY FIRMS yang Anda masukkan sudah benar.")
 else:
-    st.warning("Data belum tersedia. Periksa koneksi, bounding box, atau kuota API OpenSky.")
+    print("Total titik hotspot (setelah filter confidence):", len(titik))
+    harian = agregasi_harian(titik)
+    hasil = analisis(harian)
+    tampilkan(titik, hasil)
 
-# ---------------------------------------------------------
-# 8. Loop Auto-Refresh
-# ---------------------------------------------------------
-if is_running:
-    time.sleep(POLL_SECONDS)
-    st.rerun()
+POLL_SECONDS = 600     # FIRMS diperbarui beberapa kali sehari, jadi tidak perlu terlalu sering
+N_ULANG = 3            # batasi jumlah putaran supaya sel tidak berjalan selamanya
+
+for i in range(N_ULANG):
+    clear_output(wait=True)
+    titik = tarik_firms(MAP_KEY, SENSOR, AREA, HARI_MUNDUR)
+    hasil = analisis(agregasi_harian(titik))
+    print(f"Update ke-{i+1} | {pd.Timestamp.utcnow():%Y-%m-%d %H:%M} UTC")
+    tampilkan(titik, hasil)
+    if i < N_ULANG - 1:
+        time.sleep(POLL_SECONDS)
